@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>E-Brock String 虹膜距離測試</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #111;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #hud {
+      width: 100%;
+      padding: 12px 16px;
+      background: rgba(0, 0, 0, 0.85);
+      box-sizing: border-box;
+      text-align: center;
+      z-index: 10;
+      border-bottom: 1px solid #333;
+    }
+    .metric-row {
+      display: flex;
+      justify-content: space-around;
+      margin-top: 6px;
+    }
+    .metric-box {
+      background: #222;
+      padding: 6px 12px;
+      border-radius: 8px;
+      min-width: 110px;
+    }
+    .label { font-size: 12px; color: #aaa; }
+    .value { font-size: 22px; font-weight: bold; color: #00ffcc; }
+    #status { font-size: 14px; color: #ffcc00; margin-bottom: 4px; }
+    #video-container {
+      position: relative;
+      width: 100%;
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    video, canvas {
+      position: absolute;
+      max-width: 100%;
+      max-height: 100%;
+      transform: scaleX(-1); /* 鏡像反轉，符合自拍直覺 */
+    }
+    #start-btn {
+      position: absolute;
+      z-index: 20;
+      padding: 14px 28px;
+      font-size: 18px;
+      font-weight: bold;
+      background: #00ffcc;
+      color: #000;
+      border: none;
+      border-radius: 30px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="hud">
+    <div id="status">請按下方按鈕啟動鏡頭（載入模型約需幾秒）</div>
+    <div class="metric-row">
+      <div class="metric-box">
+        <div class="label">瞳孔像素距離 (PD)</div>
+        <div class="value" id="pd-px">--</div>
+      </div>
+      <div class="metric-box">
+        <div class="label">相對比值 (Ratio)</div>
+        <div class="value" id="pd-ratio">--</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="video-container">
+    <button id="start-btn">啟動前置鏡頭測試</button>
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+  </div>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("output_canvas");
+    const ctx = canvas.getContext("2d");
+    const startBtn = document.getElementById("start-btn");
+    const statusText = document.getElementById("status");
+    const pdPxText = document.getElementById("pd-px");
+    const pdRatioText = document.getElementById("pd-ratio");
+
+    let faceLandmarker;
+    let lastVideoTime = -1;
+
+    // 1. 初始化 MediaPipe FaceLandmarker
+    async function initModel() {
+      statusText.innerText = "正在載入 AI 眼球追蹤模型...";
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU"
+        },
+        outputFaceBlendshapes: false,
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+      statusText.innerText = "模型就緒！正在開啟鏡頭...";
+      startCamera();
+    }
+
+    // 2. 開啟手機前置鏡頭
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", () => {
+          startBtn.style.display = "none";
+          statusText.innerText = "追蹤中：綠色點 = 虹膜中心，藍色點 = 外眼角";
+          predictWebcam();
+        });
+      } catch (err) {
+        statusText.innerText = "無法開啟鏡頭：" + err.message;
+      }
+    }
+
+    // 計算兩點距離
+    function getDistance(p1, p2, width, height) {
+      const dx = (p1.x - p2.x) * width;
+      const dy = (p1.y - p2.y) * height;
+      return Math.hypot(dx, dy);
+    }
+
+    // 畫點輔助函式
+    function drawDot(point, color, radius = 4) {
+      ctx.beginPath();
+      ctx.arc(point.x * canvas.width, point.y * canvas.height, radius, 0, 2 * Math.PI);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    // 3. 逐幀偵測與計算
+    async function predictWebcam() {
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+
+      let startTimeMs = performance.now();
+      if (lastVideoTime !== video.currentTime) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, startTimeMs);
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+          const landmarks = results.faceLandmarks[0];
+
+          // MediaPipe 標準點位：
+          // 468: 右眼虹膜中心, 473: 左眼虹膜中心
+          // 33: 右眼外眼角, 263: 左眼外眼角
+          const rightIris = landmarks[468];
+          const leftIris = landmarks[473];
+          const rightOuterCorner = landmarks[33];
+          const leftOuterCorner = landmarks[263];
+
+          if (rightIris && leftIris && rightOuterCorner && leftOuterCorner) {
+            // 畫出虹膜中心 (螢光綠) 與 外眼角 (天藍色)
+            drawDot(rightIris, "#00ff00", 5);
+            drawDot(leftIris, "#00ff00", 5);
+            drawDot(rightOuterCorner, "#00aaff", 4);
+            drawDot(leftOuterCorner, "#00aaff", 4);
+
+            // 計算像素距離與相對比值
+            const irisDist = getDistance(rightIris, leftIris, canvas.width, canvas.height);
+            const outerDist = getDistance(rightOuterCorner, leftOuterCorner, canvas.width, canvas.height);
+            const ratio = irisDist / outerDist;
+
+            pdPxText.innerText = irisDist.toFixed(1) + " px";
+            pdRatioText.innerText = ratio.toFixed(3);
+          }
+        } else {
+          pdPxText.innerText = "未偵測到人臉";
+          pdRatioText.innerText = "--";
+        }
+      }
+      requestAnimationFrame(predictWebcam);
+    }
+
+    startBtn.addEventListener("click", () => {
+      startBtn.disabled = true;
+      startBtn.innerText = "載入中...";
+      initModel();
+    });
+  </script>
+</body>
+</html>
